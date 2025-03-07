@@ -28,7 +28,7 @@ for subdir, dirs, files in os.walk(rootdir):
             with open(file, "r") as inp:
                 with open(file.split(".")[0] + ".xyz", "w") as out:
                     counter_line = 0
-                    lines = out.readlines()
+                    lines = inp.readlines()
                     for line in lines:
                         try:
                             if (
