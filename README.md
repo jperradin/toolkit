@@ -2,10 +2,8 @@
 
 That repository stores all my useful scripts on different branches.
 
-Use bash command to clone a specific branch:
-```bash
-git clone -b <branch> <repo_URL>
-```
+Arborescence:
+
 - main:
   - README.md
 - lammps :
@@ -30,3 +28,15 @@ git clone -b <branch> <repo_URL>
   - launch_reve.py
   - get_reve_results.py
 
+## To pull a branch
+```bash
+git clone -b <branch> git@github.com:jperradin/toolkit.git
+```
+
+## To push on a branch
+
+```bash
+git add <modified_scripts> 
+git commit -m "updated <modified_scripts>"
+git push origin <branch>
+```
