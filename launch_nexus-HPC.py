@@ -11,14 +11,14 @@ import traceback
 def run_single_analysis(task):
     """Process a single file with explicit error handling"""
     path, name = task
-    
+
     # IMPORTANT: Print immediately to confirm the process started
     print(f"[WORKER {os.getpid()}] Starting: {name}", flush=True)
-    
+
     try:
         # Test if modules are accessible
         print(f"[WORKER {os.getpid()}] Modules loaded OK", flush=True)
-        
+
         # Lattice settings
         config_lattice = c.LatticeSettings(
             apply_custom_lattice=False,
@@ -70,7 +70,7 @@ def run_single_analysis(task):
 
         # Second analysis: coordination [6, 6]
         config_analysis.overwrite = False
-        
+
         config_clustering = c.ClusteringSettings(
             criterion="bond",
             node_types=["Si", "O"],
@@ -130,7 +130,7 @@ def run_single_analysis(task):
 
         print(f"[WORKER {os.getpid()}] Running analysis 3/3 for {name}", flush=True)
         main(settings)
-        
+
         print(f"[WORKER {os.getpid()}] COMPLETED: {name}", flush=True)
         return {"status": "success", "name": name, "pid": os.getpid()}
 
@@ -146,7 +146,7 @@ def run_single_analysis(task):
 if __name__ == "__main__":
     print(f"[MAIN] Starting script with PID {os.getpid()}", flush=True)
     print(f"[MAIN] Python version: {sys.version}", flush=True)
-    
+
     # Load file paths and output names
     try:
         files, outputs = np.loadtxt(
@@ -165,15 +165,17 @@ if __name__ == "__main__":
         exit(1)
 
     tasks = list(zip(files, outputs))
-    
+
     if not tasks:
         print("[MAIN] No tasks found in input files.", flush=True)
         exit(1)
 
     # Get number of workers from SLURM
-    n_workers = int(os.environ.get('SLURM_NTASKS', 1))
+    n_workers = int(os.environ.get("SLURM_NTASKS", 1))
     print(f"[MAIN] SLURM_NTASKS={n_workers}", flush=True)
-    print(f"[MAIN] Processing {len(tasks)} files with {n_workers} workers\n", flush=True)
+    print(
+        f"[MAIN] Processing {len(tasks)} files with {n_workers} workers\n", flush=True
+    )
 
     # Test with just 2 tasks first for debugging
     # test_tasks = tasks[:2]
@@ -181,50 +183,58 @@ if __name__ == "__main__":
 
     results = []
     errors = []
-    
+
     try:
         # Use ProcessPoolExecutor with explicit error checking
         # with ProcessPoolExecutor(max_workers=min(n_workers, len(test_tasks))) as executor:
         with ProcessPoolExecutor(max_workers=min(n_workers, len(tasks))) as executor:
             print(f"[MAIN] ProcessPoolExecutor created", flush=True)
-            
+
             # Submit all tasks and store futures
             futures = []
             for i, task in enumerate(tasks):
                 print(f"[MAIN] Submitting task {i}: {task[1]}", flush=True)
                 future = executor.submit(run_single_analysis, task)
                 futures.append((future, task))
-            
+
             print(f"[MAIN] All tasks submitted, waiting for results...", flush=True)
-            
+
             # Explicitly get results and check for exceptions
             for i, (future, task) in enumerate(futures):
                 try:
                     print(f"[MAIN] Getting result for task {i}", flush=True)
                     result = future.result(timeout=30000)  # 5 min timeout per task
                     results.append(result)
-                    
-                    if result['status'] == 'error':
+
+                    if result["status"] == "error":
                         errors.append(result)
                         print(f"[MAIN] Task {i} failed: {result['name']}", flush=True)
                     else:
-                        print(f"[MAIN] Task {i} succeeded: {result['name']}", flush=True)
-                        
+                        print(
+                            f"[MAIN] Task {i} succeeded: {result['name']}", flush=True
+                        )
+
                 except Exception as e:
                     error_msg = f"[MAIN] Exception getting result for task {i} ({task[1]}): {e}\n{traceback.format_exc()}"
                     print(error_msg, flush=True)
                     errors.append({"name": task[1], "error": str(e)})
 
     except Exception as e:
-        print(f"[MAIN] ProcessPoolExecutor failed: {e}\n{traceback.format_exc()}", flush=True)
+        print(
+            f"[MAIN] ProcessPoolExecutor failed: {e}\n{traceback.format_exc()}",
+            flush=True,
+        )
         exit(1)
 
     # Print summary
     print(f"\n[MAIN] ===== SUMMARY =====", flush=True)
     print(f"[MAIN] Total tasks: {len(tasks)}", flush=True)
-    print(f"[MAIN] Successful: {len([r for r in results if r['status'] == 'success'])}", flush=True)
+    print(
+        f"[MAIN] Successful: {len([r for r in results if r['status'] == 'success'])}",
+        flush=True,
+    )
     print(f"[MAIN] Failed: {len(errors)}", flush=True)
-    
+
     if errors:
         print(f"\n[MAIN] Errors encountered:", flush=True)
         for err in errors:
@@ -232,4 +242,3 @@ if __name__ == "__main__":
         exit(1)
     else:
         print(f"[MAIN] All test tasks completed successfully!", flush=True)
-
