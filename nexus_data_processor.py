@@ -7,14 +7,13 @@ class DataPoint:
     """Represents a single data point from the new CSV format"""
 
     def __init__(
-        self, dens_dir, file_name, connectivity_type, concentration, value, std, error
+        self, dens_dir, file_name, connectivity_type, concentration, value, error
     ):
         self.dens_dir = dens_dir
         self.file_name = file_name
         self.connectivity_type = connectivity_type
         self.concentration = concentration
         self.value = value
-        self.std = std
         self.error = error
         self.pressure = 0.0
         self.temperature = 0.0
@@ -72,7 +71,7 @@ class DataCollection:
             else:
                 continue
 
-            data.append((x_val, dp.value, dp.std, dp.error))
+            data.append((x_val, dp.value, dp.error))
 
         # Sort by x variable
         data.sort(key=lambda x: x[0])
@@ -130,12 +129,7 @@ class DataExporter:
             # Export error file
             error_path = output_path.replace(".dat", "--errors.dat")
             self._write_error_file(
-                error_path, variable_name, connectivity_types, all_data, error_type="error"
-            )
-            # Export std file
-            std_path = output_path.replace(".dat", "--std.dat")
-            self._write_error_file(
-                std_path, variable_name, connectivity_types, all_data, error_type="std"
+                error_path, variable_name, connectivity_types, all_data
             )
 
             # For concentration data, also create individual files
@@ -164,7 +158,7 @@ class DataExporter:
         # Collect all unique x-values (variable values) and sort them
         all_x_values = set()
         for data_series in all_data:
-            for x, y, std, err in data_series:
+            for x, y, err in data_series:
                 all_x_values.add(x)
 
         sorted_x_values = sorted(list(all_x_values))
@@ -179,7 +173,7 @@ class DataExporter:
         # Fill data for each connectivity type
         for conn_idx, data_series in enumerate(all_data):
             # Create a dictionary for quick lookup of y-values by x-value
-            y_dict = {x: y for x, y, std, err in data_series}
+            y_dict = {x: y for x, y, err in data_series}
 
             # Fill the column, using 0.0 for missing data points
             for i, x_val in enumerate(sorted_x_values):
@@ -204,7 +198,7 @@ class DataExporter:
         print(f"Exported: {output_path}")
 
     def _write_error_file(
-        self, output_path, variable_name, connectivity_types, all_data, error_type
+        self, output_path, variable_name, connectivity_types, all_data
     ):
         """Write error file with indexed headers"""
 
@@ -219,7 +213,7 @@ class DataExporter:
         # Collect all unique x-values and sort them
         all_x_values = set()
         for data_series in all_data:
-            for x, y, std, err in data_series:
+            for x, y, err in data_series:
                 all_x_values.add(x)
 
         sorted_x_values = sorted(list(all_x_values))
@@ -234,12 +228,7 @@ class DataExporter:
         # Fill error data for each connectivity type
         for conn_idx, data_series in enumerate(all_data):
             # Create a dictionary for quick lookup of error values by x-value
-            if error_type == "error":
-                err_dict = {x: err for x, y, std, err in data_series}
-            elif error_type == "std":
-                err_dict = {x: std for x, y, std, err in data_series}
-            else:
-                raise ValueError(f"Invalid error_type: {error_type}")
+            err_dict = {x: err for x, y, err in data_series}
 
             # Fill the column, using 0.0 for missing data points
             for i, x_val in enumerate(sorted_x_values):
@@ -260,9 +249,6 @@ class DataExporter:
                 for col_idx in range(n_columns):
                     f.write(f"{error_matrix[col_idx, point_idx]:^10.5f}\t")
                 f.write("\n")
-                
-        # debug
-        hold = 1
 
     def export_concentration_files(self):
         """Export individual concentration files for each connectivity type"""
@@ -299,12 +285,11 @@ class DataExporter:
                 with open(output_path, "w") as f:
                     f.write("# 1 concentration\n")
                     f.write("# 2 data\n")
-                    f.write("# 3 std\n")
-                    f.write("# 4 error\n")
+                    f.write("# 3 error\n")
 
-                    for concentration, value, std, error in concentration_data:
+                    for concentration, value, error in concentration_data:
                         f.write(
-                            f"{concentration:^10.5f}\t{value:^10.5f}\t{std:^10.5f}\t{error:^10.5f}\n"
+                            f"{concentration:^10.5f}\t{value:^10.5f}\t{error:^10.5f}\n"
                         )
 
                 print(f"Exported concentration file: {output_path}")
@@ -323,13 +308,11 @@ def parse_csv_file(filepath):
             line = line.strip()
             if line and not line.startswith("#") and "," in line:
                 parts = line.split(",")
-                if len(parts) >= 4:
+                if len(parts) >= 4 and 'concentrations.dat' not in filepath:
                     connectivity_type = parts[0].strip()
                     concentration = float(parts[1].strip())
                     value = float(parts[2].strip())
-                    std_str = parts[3].strip()
-                    std = 0.0 if std_str == "nan" else float(std_str)
-                    error_str = parts[4].strip()
+                    error_str = parts[3].strip()
                     error = 0.0 if error_str == "nan" else float(error_str)
 
                     results.append(
@@ -337,8 +320,22 @@ def parse_csv_file(filepath):
                             "connectivity_type": connectivity_type,
                             "concentration": concentration,
                             "value": value,
-                            "std": std,
                             "error": error,
+                        }
+                    )
+                elif len(parts) >= 4 and 'concentrations.dat' in filepath:
+                    connectivity_type = parts[0].strip()
+                    concentration = float(parts[1].strip())
+                    value = float(parts[1].strip())
+                    error_str = parts[3].strip()
+                    error = 0.0 if error_str == "nan" else float(error_str)
+
+                    results.append(
+                        {
+                            "connectivity_type": connectivity_type,
+                            "concentration": concentration,
+                            "value": value,
+                           "error": error,
                         }
                     )
 
@@ -392,6 +389,7 @@ def main():
         "order_parameter.dat",
         "percolation_probability.dat",
         "largest_cluster_size.dat",
+        "concentrations.dat",
     ]
 
     # Find density directories
@@ -448,7 +446,6 @@ def main():
                             connectivity_type=data_dict["connectivity_type"],
                             concentration=data_dict["concentration"],
                             value=data_dict["value"],
-                            std=data_dict["std"],
                             error=data_dict["error"],
                         )
 
@@ -480,4 +477,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-   main()
