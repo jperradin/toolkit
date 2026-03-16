@@ -1,452 +1,376 @@
-import numpy as np
+"""
+average_export.py
+-----------------
+Averages N independent sample exports (produced by export.py) into a single
+averaged_export/ directory.
+
+Expected input layout (configurable via SAMPLE_GLOB):
+
+    ./8a/analysis/export/
+    ./8b/analysis/export/
+    ...
+    ./8e/analysis/export/
+
+Two file types are handled:
+
+1. Standard files  (<var>-<property>.dat  +  --errors.dat  +  --std.dat)
+   Columns: x-axis | one column per connectivity type ...
+   Output columns per connectivity type:
+       mean, std (ddof=1), sem=std/sqrt(N), mean_err, combined=sqrt(sem²+mean_err²)
+
+2. Concentration files  (concentrations/<name>.dat)
+   Columns: concentration | value | std | error   (one file per connectivity type,
+   no companion --errors / --std files).
+   Output columns: concentration | mean | std | sem | mean_err | combined_err
+
+Output is written to ./averaged_export/ mirroring the input structure.
+"""
+
 import os
 import glob
-from collections import defaultdict
-import re
-
-
-class SampleData:
-    """Represents data from a single sample"""
-
-    def __init__(self, sample_name, file_path):
-        self.sample_name = sample_name
-        self.file_path = file_path
-        self.headers = []
-        self.data = None
-        self.variable_name = None
-        self.connectivity_types = []
-
-    def load_data(self):
-        """Load data from file and parse headers"""
-        try:
-            with open(self.file_path, "r") as f:
-                lines = f.readlines()
-
-            # Parse headers
-            self.headers = []
-            data_start = 0
-            for i, line in enumerate(lines):
-                if line.startswith("#"):
-                    # Parse header like "# 1 pressure" or "# 2 HD"
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        col_num = int(parts[1])
-                        col_name = parts[2]
-                        self.headers.append(col_name)
-                        if col_num == 1:
-                            self.variable_name = col_name
-                        else:
-                            self.connectivity_types.append(col_name)
-                else:
-                    data_start = i
-                    break
-
-            # Load numerical data
-            data_lines = [line.strip() for line in lines[data_start:] if line.strip()]
-            if data_lines:
-                data_matrix = []
-                for line in data_lines:
-                    values = [float(x) for x in line.split()]
-                    data_matrix.append(values)
-                self.data = np.array(data_matrix)
-
-            return True
-
-        except Exception as e:
-            print(f"Error loading {self.file_path}: {e}")
-            return False
-
-    def get_variable_values(self):
-        """Get the x-axis values (pressure, density, etc.)"""
-        if self.data is not None and len(self.data) > 0:
-            return self.data[:, 0]
-        return np.array([])
-
-    def get_connectivity_data(self, connectivity_idx):
-        """Get data for a specific connectivity type"""
-        if self.data is not None and len(self.data) > 0:
-            col_idx = connectivity_idx + 1  # +1 because first column is variable
-            if col_idx < self.data.shape[1]:
-                return self.data[:, col_idx]
-        return np.array([])
-
-
-class ConcentrationSampleData:
-    """Represents concentration data from a single sample"""
-
-    def __init__(self, sample_name, file_path):
-        self.sample_name = sample_name
-        self.file_path = file_path
-        self.data = None
-
-    def load_data(self):
-        """Load concentration data (concentration, value, error)"""
-        try:
-            with open(self.file_path, "r") as f:
-                lines = f.readlines()
-
-            # Skip header lines
-            data_lines = [
-                line.strip()
-                for line in lines
-                if not line.startswith("#") and line.strip()
-            ]
-
-            if data_lines:
-                data_matrix = []
-                for line in data_lines:
-                    values = [float(x) for x in line.split()]
-                    if len(values) >= 3:  # concentration, value, error
-                        data_matrix.append(values)
-                self.data = np.array(data_matrix)
-
-            return True
-
-        except Exception as e:
-            print(f"Error loading {self.file_path}: {e}")
-            return False
-
-    def get_concentration_values(self):
-        """Get concentration values"""
-        if self.data is not None:
-            return self.data[:, 0]
-        return np.array([])
-
-    def get_data_values(self):
-        """Get data values"""
-        if self.data is not None:
-            return self.data[:, 1]
-        return np.array([])
-
-    def get_error_values(self):
-        """Get error values"""
-        if self.data is not None:
-            return self.data[:, 2]
-        return np.array([])
-
-
-class MultiSampleProcessor:
-    """Main class for processing multiple samples"""
-
-    def __init__(self, sample_dirs, output_dir="./averaged_export"):
-        self.sample_dirs = sample_dirs
-        self.output_dir = output_dir
-        self.ensure_output_dirs()
-
-    def ensure_output_dirs(self):
-        """Create output directories"""
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-
-        concentrations_dir = os.path.join(self.output_dir, "concentrations")
-        if not os.path.exists(concentrations_dir):
-            os.makedirs(concentrations_dir)
-
-    def find_common_files(self):
-        """Find files that exist in all sample directories"""
-        all_files = {}
-
-        for sample_dir in self.sample_dirs:
-            export_dir = os.path.join(sample_dir, "export")
-            if not os.path.exists(export_dir):
-                print(f"Warning: {export_dir} not found")
-                continue
-
-            # Find regular export files (not in concentrations/)
-            regular_files = glob.glob(os.path.join(export_dir, "*.dat"))
-            regular_files = [
-                os.path.basename(f)
-                for f in regular_files
-                if not f.endswith("--errors.dat")
-            ]
-
-            # Find concentration files
-            concentrations_dir = os.path.join(export_dir, "concentrations")
-            concentration_files = []
-            if os.path.exists(concentrations_dir):
-                concentration_files = glob.glob(
-                    os.path.join(concentrations_dir, "*.dat")
-                )
-                concentration_files = [os.path.basename(f) for f in concentration_files]
-
-            sample_name = os.path.basename(sample_dir.rstrip("/"))
-            all_files[sample_name] = {
-                "regular": regular_files,
-                "concentration": concentration_files,
-            }
-
-        # Find common files across all samples
-        if not all_files:
-            return {}, {}
-
-        sample_names = list(all_files.keys())
-        common_regular = set(all_files[sample_names[0]]["regular"])
-        common_concentration = set(all_files[sample_names[0]]["concentration"])
-
-        for sample_name in sample_names[1:]:
-            common_regular &= set(all_files[sample_name]["regular"])
-            common_concentration &= set(all_files[sample_name]["concentration"])
-
-        return sorted(list(common_regular)), sorted(list(common_concentration))
-
-    def process_regular_files(self, common_files):
-        """Process regular export files (pressure-, density-, etc.)"""
-        print(f"\nProcessing {len(common_files)} regular files...")
-
-        for filename in common_files:
-            print(f"Processing: {filename}")
-
-            # Collect data from all samples
-            samples_data = []
-            for sample_dir in self.sample_dirs:
-                file_path = os.path.join(sample_dir, "export", filename)
-                if os.path.exists(file_path):
-                    sample_name = os.path.basename(sample_dir.rstrip("/"))
-                    sample_data = SampleData(sample_name, file_path)
-                    if sample_data.load_data():
-                        samples_data.append(sample_data)
-
-            if not samples_data:
-                print(f"  No valid data found for {filename}")
-                continue
-
-            # Process the data
-            self._average_regular_file(filename, samples_data)
-
-    def _average_regular_file(self, filename, samples_data):
-        """Average data from multiple samples for a regular file - averaging both x and y"""
-
-        # Get reference sample for structure
-        ref_sample = samples_data[0]
-        variable_name = ref_sample.variable_name
-        connectivity_types = ref_sample.connectivity_types
-
-        # Find the maximum number of data points across all samples
-        max_points = max(len(sample.get_variable_values()) for sample in samples_data)
-
-        if max_points == 0:
-            print(f"  No data points found for {filename}")
-            return
-
-        # Create output matrices
-        n_connectivities = len(connectivity_types)
-
-        averaged_data = np.zeros(
-            (max_points, n_connectivities + 1)
-        )  # +1 for x variable
-        std_data = np.zeros((max_points, n_connectivities + 1))
-
-        # For each data point index, collect values from all samples
-        for point_idx in range(max_points):
-            # Collect x-values at this point index from all samples
-            x_values_at_point = []
-            for sample in samples_data:
-                x_values = sample.get_variable_values()
-                if point_idx < len(x_values):
-                    x_values_at_point.append(x_values[point_idx])
-
-            # Average x-values
-            if x_values_at_point:
-                averaged_data[point_idx, 0] = np.mean(x_values_at_point)
-                std_data[point_idx, 0] = (
-                    np.std(x_values_at_point, ddof=1)
-                    if len(x_values_at_point) > 1
-                    else 0.0
-                )
-
-            # Process each connectivity type
-            for conn_idx, connectivity in enumerate(connectivity_types):
-                # Collect y-values at this point index from all samples
-                y_values_at_point = []
-                for sample in samples_data:
-                    conn_data = sample.get_connectivity_data(conn_idx)
-                    if point_idx < len(conn_data):
-                        y_values_at_point.append(conn_data[point_idx])
-
-                # Average y-values
-                if y_values_at_point:
-                    averaged_data[point_idx, conn_idx + 1] = np.mean(y_values_at_point)
-                    std_data[point_idx, conn_idx + 1] = (
-                        np.std(y_values_at_point, ddof=1)
-                        if len(y_values_at_point) > 1
-                        else 0.0
-                    )
-                else:
-                    averaged_data[point_idx, conn_idx + 1] = 0.0
-                    std_data[point_idx, conn_idx + 1] = 0.0
-
-        # Write output files
-        self._write_averaged_file(
-            filename, variable_name, connectivity_types, averaged_data, "average"
-        )
-        self._write_averaged_file(
-            filename.replace(".dat", "--std.dat"),
-            variable_name,
-            connectivity_types,
-            std_data,
-            "std",
-        )
-
-    def _write_averaged_file(
-        self, filename, variable_name, connectivity_types, data_matrix, data_type
-    ):
-        """Write averaged or std data file"""
-
-        output_path = os.path.join(self.output_dir, filename)
-
-        with open(output_path, "w") as f:
-            # Write headers
-            f.write(f"# Multi-sample {data_type} data\n")
-            f.write(f"# 1 {variable_name}\n")
-            for i, conn_type in enumerate(connectivity_types):
-                f.write(f"# {i + 2} {conn_type}\n")
-
-            # Write data
-            for row in data_matrix:
-                for val in row:
-                    f.write(f"{val:^12.6f}\t")
-                f.write("\n")
-
-        print(f"  Exported: {output_path}")
-
-    def process_concentration_files(self, common_files):
-        """Process concentration files from concentrations/ directory"""
-        print(f"\nProcessing {len(common_files)} concentration files...")
-
-        for filename in common_files:
-            print(f"Processing: {filename}")
-
-            # Collect data from all samples
-            samples_data = []
-            for sample_dir in self.sample_dirs:
-                file_path = os.path.join(
-                    sample_dir, "export", "concentrations", filename
-                )
-                if os.path.exists(file_path):
-                    sample_name = os.path.basename(sample_dir.rstrip("/"))
-                    sample_data = ConcentrationSampleData(sample_name, file_path)
-                    if sample_data.load_data():
-                        samples_data.append(sample_data)
-
-            if not samples_data:
-                print(f"  No valid data found for {filename}")
-                continue
-
-            # Process the concentration data
-            self._average_concentration_file(filename, samples_data)
-
-    def _average_concentration_file(self, filename, samples_data):
-        """Average concentration data from multiple samples - averaging both x and y"""
-
-        # Find the maximum number of data points across all samples
-        max_points = max(
-            len(sample.get_concentration_values()) for sample in samples_data
-        )
-
-        if max_points == 0:
-            print(f"  No concentration data found for {filename}")
-            return
-
-        # Create output arrays
-        averaged_data = np.zeros((max_points, 3))  # concentration, averaged_value, std
-
-        # For each data point index, collect values from all samples
-        for point_idx in range(max_points):
-            # Collect concentration values (x) at this point index
-            conc_values_at_point = []
-            data_values_at_point = []
-
-            for sample in samples_data:
-                concentrations = sample.get_concentration_values()
-                data_values = sample.get_data_values()
-
-                if point_idx < len(concentrations) and point_idx < len(data_values):
-                    conc_values_at_point.append(concentrations[point_idx])
-                    data_values_at_point.append(data_values[point_idx])
-
-            # Average both concentration (x) and data (y) values
-            if conc_values_at_point and data_values_at_point:
-                # Average x-values (concentrations)
-                averaged_data[point_idx, 0] = np.mean(conc_values_at_point)
-
-                # Average y-values (data values)
-                data_array = np.array(data_values_at_point)
-                averaged_data[point_idx, 1] = np.mean(data_array)
-                averaged_data[point_idx, 2] = (
-                    np.std(data_array, ddof=1) if len(data_array) > 1 else 0.0
-                )
+import numpy as np
+from natsort import natsorted
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Glob pattern relative to the working directory that finds each sample's
+# export folder.  '*' matches 8a, 8b, 8c, …
+SAMPLE_GLOB  = "*/analysis/export"
+OUTPUT_DIR   = "./averaged_export"
+
+# ---------------------------------------------------------------------------
+# File I/O helpers
+# ---------------------------------------------------------------------------
+
+def parse_dat_file(filepath):
+    """
+    Parse a .dat file produced by export.py.
+
+    Returns:
+        headers : list of str   – column names in order (index 0 = x-axis variable)
+        data    : np.ndarray    – shape (n_cols, n_rows), data_matrix[col, row]
+    """
+    headers = []
+    rows    = []
+
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                # e.g.  "# 1 density"  or  "# 2 HD"
+                parts = line.lstrip("# ").split()
+                if len(parts) >= 2:
+                    headers.append(" ".join(parts[1:]))  # skip the index number
             else:
-                averaged_data[point_idx, 0] = 0.0
-                averaged_data[point_idx, 1] = 0.0
-                averaged_data[point_idx, 2] = 0.0
+                values = line.split()
+                if values:
+                    rows.append([float(v) for v in values])
 
-        # Write output file
-        output_path = os.path.join(
-            self.output_dir,
-            "concentrations",
-            filename.replace(".dat", "--averaged.dat"),
+    if not rows:
+        return headers, np.empty((len(headers), 0))
+
+    data = np.array(rows).T   # shape: (n_cols, n_rows)
+    return headers, data
+
+
+def write_dat_file(filepath, headers, data, description=None):
+    """
+    Write a .dat file in the same format as export.py produces.
+
+    headers     : list of str, len == data.shape[0]
+    data        : np.ndarray, shape (n_cols, n_rows)
+    description : optional str written as a comment block before the column headers
+    """
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+        if description:
+            for line in description.splitlines():
+                f.write(f"# {line}\n")
+            f.write("#\n")
+        for i, h in enumerate(headers):
+            f.write(f"# {i + 1} {h}\n")
+        for j in range(data.shape[1]):
+            f.write("\t".join(f"{data[col, j]:^14.6g}" for col in range(data.shape[0])))
+            f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Core averaging logic
+# ---------------------------------------------------------------------------
+
+def check_shapes(paths, label):
+    """
+    Verify all files in a group have the same shape.
+    Raises ValueError with a clear message if they differ.
+    """
+    shapes = []
+    for p in paths:
+        _, d = parse_dat_file(p)
+        shapes.append(d.shape)
+    if len(set(shapes)) > 1:
+        msg = f"Shape mismatch in {label}:\n"
+        for p, s in zip(paths, shapes):
+            msg += f"  {p}: {s}\n"
+        raise ValueError(msg)
+
+
+def is_concentration_file(rel_path):
+    """
+    Return True for files inside the concentrations/ subdirectory.
+    These have a different column layout and no companion --errors / --std files.
+    """
+    parts = rel_path.replace("\\", "/").split("/")
+    return "concentrations" in parts
+
+
+def average_concentration_file(paths):
+    """
+    Average a concentration-property-connectivity.dat file across N samples.
+
+    All samples follow the same thermo-mechanical pathway, so row i in
+    sample A corresponds exactly to row i in sample B, etc.
+    Averaging is done directly row by row — no alignment needed.
+
+    Input columns:  concentration | value | std | error
+    Output columns: concentration | mean | std | sem | mean_err | combined_err
+    """
+    N       = len(paths)
+    samples = [parse_dat_file(p)[1] for p in paths]  # each: (4, n_rows)
+
+    check_shapes(paths, paths[0])
+
+    # x-axis: take from sample 0 (identical across all samples)
+    x_col = samples[0][0]                              # (n_rows,)
+    vals  = np.array([d[1] for d in samples])          # (N, n_rows): value column
+    errs  = np.array([d[3] for d in samples])          # (N, n_rows): error column
+
+    mean     = vals.mean(axis=0)
+    std      = vals.std(axis=0, ddof=1)
+    sem      = std / np.sqrt(N)
+    mean_err = errs.mean(axis=0)
+    combined = np.sqrt(sem**2 + mean_err**2)
+
+    out_data    = np.vstack([x_col, mean, std, sem, mean_err, combined])
+    out_headers = ["concentration", "mean", "std", "sem", "mean_err", "combined_err"]
+    return out_headers, out_data
+
+
+def average_file_group(base_paths, errors_paths, std_paths):
+    """
+    Average a group of standard export files across N samples.
+
+    All samples follow the same thermo-mechanical pathway, so row i in
+    sample A corresponds exactly to row i in sample B, etc.
+    Averaging is done directly row by row — no alignment needed.
+
+    Returns a dict with four keys, each mapping to (headers, data):
+        'mean'   – mean of values across N samples,   shape (1 + n_ct, n_rows)
+        'std'    – sample std (ddof=1),                shape (1 + n_ct, n_rows)
+        'sem'    – std / sqrt(N),                      shape (1 + n_ct, n_rows)
+        'errors' – sqrt(SEM² + mean_per-point_err²),  shape (1 + n_ct, n_rows)
+
+    All four matrices share the same x-axis column 0 and the same headers:
+        [variable_name, connectivity_type_1, connectivity_type_2, ...]
+    """
+    check_shapes(base_paths,   base_paths[0])
+    check_shapes(errors_paths, errors_paths[0])
+
+    sample_headers = []
+    sample_base    = []
+    sample_errors  = []
+
+    for bp, ep, _sp in zip(base_paths, errors_paths, std_paths):
+        h, d  = parse_dat_file(bp)
+        sample_headers.append(h)
+        sample_base.append(d)
+        _, de = parse_dat_file(ep)
+        sample_errors.append(de)
+
+    headers_in         = sample_headers[0]
+    variable_name      = headers_in[0]
+    connectivity_types = headers_in[1:]
+    N                  = len(base_paths)
+    n_ct               = len(connectivity_types)
+    n_rows             = sample_base[0].shape[1]
+
+    # x-axis: take from sample 0 (identical across all samples)
+    x_col = sample_base[0][0]   # (n_rows,)
+
+    mat_mean   = np.zeros((1 + n_ct, n_rows))
+    mat_std    = np.zeros((1 + n_ct, n_rows))
+    mat_sem    = np.zeros((1 + n_ct, n_rows))
+    mat_errors = np.zeros((1 + n_ct, n_rows))
+    for m in (mat_mean, mat_std, mat_sem, mat_errors):
+        m[0] = x_col
+
+    for ci in range(n_ct):
+        col = ci + 1   # col 0 is the x-axis
+
+        vals     = np.array([d[col] for d in sample_base])    # (N, n_rows)
+        errs     = np.array([d[col] for d in sample_errors])  # (N, n_rows)
+
+        mean     = vals.mean(axis=0)
+        std      = vals.std(axis=0, ddof=1)
+        sem      = std / np.sqrt(N)
+        mean_err = errs.mean(axis=0)
+        combined = np.sqrt(sem**2 + mean_err**2)
+
+        mat_mean  [col] = mean
+        mat_std   [col] = std
+        mat_sem   [col] = sem
+        mat_errors[col] = combined
+
+    headers = [variable_name] + list(connectivity_types)
+
+    return {
+        'mean':   (headers, mat_mean),
+        'std':    (headers, mat_std),
+        'sem':    (headers, mat_sem),
+        'errors': (headers, mat_errors),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Directory scanning
+# ---------------------------------------------------------------------------
+
+def find_sample_dirs():
+    """Return natsorted list of export directories matching SAMPLE_GLOB."""
+    dirs = natsorted(glob.glob(SAMPLE_GLOB))
+    if not dirs:
+        raise FileNotFoundError(
+            f"No sample directories found matching pattern '{SAMPLE_GLOB}'. "
+            "Check SAMPLE_GLOB in the configuration."
         )
+    print(f"Found {len(dirs)} sample(s):")
+    for d in dirs:
+        print(f"  {d}")
+    return dirs
 
-        with open(output_path, "w") as f:
-            f.write("# Multi-sample averaged concentration data\n")
-            f.write("# 1 concentration_averaged\n")
-            f.write("# 2 data_averaged\n")
-            f.write("# 3 data_std_deviation\n")
 
-            for row in averaged_data:
-                f.write(f"{row[0]:^12.6f}\t{row[1]:^12.6f}\t{row[2]:^12.6f}\n")
+def collect_base_files(sample_dirs):
+    """
+    Return a dict  { relative_filename: [path_in_sample_0, path_in_sample_1, …] }
+    for every base .dat file (excluding --errors and --std companions)
+    present in ALL samples.
+    """
+    # Gather files present in every sample
+    sets = []
+    for sd in sample_dirs:
+        files = set()
+        for root, _, fnames in os.walk(sd):
+            for fname in fnames:
+                if fname.endswith(".dat") and "--" not in fname:
+                    rel = os.path.relpath(os.path.join(root, fname), sd)
+                    files.add(rel)
+        sets.append(files)
 
-        print(f"  Exported: {output_path}")
+    common = sets[0].intersection(*sets[1:])
 
+    result = {}
+    for rel in sorted(common):
+        result[rel] = [os.path.join(sd, rel) for sd in sample_dirs]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    """Main function"""
+    sample_dirs = find_sample_dirs()
+    N           = len(sample_dirs)
+    print(f"\nAveraging over {N} samples.")
 
-    # Configuration
-    base_dir = "./"  # Current directory
-    sample_patterns = ["4a", "4b", "4c", "4d", "4e"]  # Sample directory names
+    base_files = collect_base_files(sample_dirs)
+    print(f"Base files to average: {len(base_files)}\n")
 
-    # Find sample directories
-    sample_dirs = []
-    for pattern in sample_patterns:
-        sample_path = os.path.join(base_dir, pattern)
-        if os.path.exists(sample_path):
-            sample_dirs.append(sample_path)
-        else:
-            print(f"Warning: Sample directory {sample_path} not found")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "concentrations"), exist_ok=True)
 
-    if not sample_dirs:
-        print("Error: No sample directories found!")
-        return
+    # Descriptions written at the top of each output file type
+    desc = {
+        'mean': (
+            f"Average over N={N} independent samples."
+            f"\n  mean(s) = ( s_1 + s_2 + ... + s_N ) / N"
+        ),
+        'std': (
+            f"Sample standard deviation over N={N} independent samples (ddof=1)."
+            f"\n  std(s) = sqrt( sum( (s_i - mean)^2 ) / (N-1) )"
+        ),
+        'sem': (
+            f"Standard error of the mean over N={N} independent samples."
+            f"\n  SEM(s) = std(s) / sqrt(N)"
+        ),
+        'errors': (
+            f"Combined error over N={N} independent samples."
+            f"\n  err(s) = sqrt( SEM(s)^2 + mean(err_i)^2 )"
+            f"\n  where err_i is the per-point measurement error of sample i."
+        ),
+        'concentration': (
+            f"Averaged concentration file over N={N} independent samples."
+            f"\n  mean(s)     = ( s_1 + ... + s_N ) / N"
+            f"\n  std(s)      = sqrt( sum( (s_i - mean)^2 ) / (N-1) )"
+            f"\n  SEM(s)      = std(s) / sqrt(N)"
+            f"\n  mean_err(s) = mean of per-point measurement errors err_i"
+            f"\n  combined    = sqrt( SEM^2 + mean_err^2 )"
+        ),
+    }
 
-    print(
-        f"Found {len(sample_dirs)} sample directories: {[os.path.basename(d) for d in sample_dirs]}"
-    )
+    for rel_path, abs_paths in base_files.items():
 
-    # Initialize processor
-    processor = MultiSampleProcessor(sample_dirs)
+        # --- concentration files: different layout, no companion files -------
+        if is_concentration_file(rel_path):
+            try:
+                headers, data = average_concentration_file(abs_paths)
+            except Exception as e:
+                print(f"  Error averaging {rel_path}: {e}")
+                continue
+            out_path = os.path.join(OUTPUT_DIR, rel_path)
+            write_dat_file(out_path, headers, data, description=desc['concentration'])
+            print(f"  Exported: {out_path}")
+            continue
 
-    # Find common files across all samples
-    common_regular, common_concentration = processor.find_common_files()
+        # --- standard files: require --errors and --std companions -----------
+        errors_paths = [p.replace(".dat", "--errors.dat") for p in abs_paths]
+        std_paths    = [p.replace(".dat", "--std.dat")    for p in abs_paths]
 
-    print(f"Found {len(common_regular)} common regular files")
-    print(f"Found {len(common_concentration)} common concentration files")
+        # Skip if any companion file is missing in any sample
+        missing = [
+            p for p in errors_paths + std_paths
+            if not os.path.exists(p)
+        ]
+        if missing:
+            print(f"  Skipping {rel_path} — missing companion files:")
+            for m in missing:
+                print(f"    {m}")
+            continue
 
-    if not common_regular and not common_concentration:
-        print("No common files found across all samples!")
-        return
+        try:
+            results = average_file_group(abs_paths, errors_paths, std_paths)
+        except Exception as e:
+            print(f"  Error averaging {rel_path}: {e}")
+            continue
 
-    # Process files
-    if common_regular:
-        processor.process_regular_files(common_regular)
+        # Write the four output files mirroring the input naming convention:
+        #   base.dat            → mean values
+        #   base--std.dat       → sample std (ddof=1)
+        #   base--SEM.dat       → standard error of the mean
+        #   base--errors.dat    → combined error sqrt(SEM² + mean_per-point_err²)
+        base_out = os.path.join(OUTPUT_DIR, rel_path)
+        for key, suffix in [('mean',   ''),
+                             ('std',    '--std.dat'),
+                             ('sem',    '--SEM.dat'),
+                             ('errors', '--errors.dat')]:
+            out_path = base_out if suffix == '' else base_out.replace(".dat", suffix)
+            headers, data = results[key]
+            write_dat_file(out_path, headers, data, description=desc[key])
+        print(f"  Exported: {base_out} (+ --std, --SEM, --errors)")
 
-    if common_concentration:
-        processor.process_concentration_files(common_concentration)
-
-    print(f"\nProcessing complete! Results saved to: {processor.output_dir}")
-    print(f"- Regular averaged files: {len(common_regular)}")
-    print(f"- Standard deviation files: {len(common_regular)}")
-    print(f"- Concentration averaged files: {len(common_concentration)}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
