@@ -29,11 +29,13 @@ Examples:
 """
 
 import argparse
+import glob
 import os
 import re
 import sys
 
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 
 # --------------------------------------------------------------------------- #
 # Thresholds (physical scale: fractions of the P fluctuation width std(P))    #
@@ -98,25 +100,55 @@ def mean_sem(x):
 class Block:
     """One thermo table (one ``run``) with the columns we need."""
 
-    def __init__(self, cols, arr, tset, is_prod, complete):
+    def __init__(self, cols, arr, tset, is_prod, complete, log_dir=None):
         self.tset = tset            # target temperature (K)
         self.is_prod = is_prod      # production block (had a fix ave/time)?
         self.complete = complete    # did the run finish (Loop time seen)?
         idx = {c: cols.index(c) for c in cols}
         self.step = arr[:, idx[_C_STEP]]
         self.temp = arr[:, idx[_C_TEMP]]
-        self.press = arr[:, idx[_C_PRESS]] / 1000.0          # bar -> kbar
+        self.press = arr[:, idx[_C_PRESS]] / 10000.0         # bar -> GPa
         self.pe = arr[:, idx[_C_PE]]                          # eV
         self.msd = arr[:, idx[_C_MSD]] if _C_MSD in idx else None
         self.cn = arr[:, idx[_C_CN]] if _C_CN in idx else None
         self.t_ns = (self.step - self.step[0]) * DT_PS / 1000.0
 
+        # Full-resolution Si MSD from the per-step file written by build_tree
+        #   (fix msd ave/time 1 1 1 ... file msd_<T>K.dat).  Columns are
+        #   "TimeStep  c_msd1[4](A^2)".  Keep the RAW series (every 1.6 fs) for
+        #   the log-log MSD plot, and an interpolation onto the thermo grid for
+        #   the scalar diagnostics (msd_end, msd_slope).
+        self.msd_raw_t = None        # ns, full resolution
+        self.msd_raw = None          # A^2, full resolution
+        if self.is_prod and log_dir and tset is not None:
+            msd_file = os.path.join(log_dir, f"msd_{int(tset)}K.dat")
+            if os.path.isfile(msd_file):
+                try:
+                    d = np.loadtxt(msd_file, comments="#")
+                    if d.ndim == 2 and d.shape[0] > 1:
+                        steps = d[:, 0] - d[0, 0]      # col 0 = TimeStep
+                        msd = d[:, 1]                  # col 1 = MSD (A^2)
+                        self.msd_raw_t = steps * DT_PS / 1000.0
+                        self.msd_raw = msd
+                        self.msd = np.interp(self.step - self.step[0],
+                                             steps, msd)
+                except Exception:
+                    pass
 
-def parse_log(log_file):
-    """Split a log into ordered Blocks, tagging production runs and target T."""
-    with open(log_file) as fh:
-        lines = fh.readlines()
 
+def parse_log(log_files):
+    """Split log(s) into ordered Blocks, tagging production runs and target T.
+
+    Accepts a single path or a list (the chained segment logs log.seg*.lammps),
+    concatenated in order so the full ladder is parsed as one run."""
+    if isinstance(log_files, str):
+        log_files = [log_files]
+    lines = []
+    for lf in log_files:
+        with open(lf) as fh:
+            lines += fh.readlines()
+
+    log_dir = os.path.dirname(log_files[0])
     blocks = []
     cols = None
     rows = None
@@ -127,7 +159,7 @@ def parse_log(log_file):
         nonlocal rows, pending_prod
         if rows:
             arr = np.array(rows, dtype=float)
-            blocks.append(Block(cols, arr, cur_tset, pending_prod, complete))
+            blocks.append(Block(cols, arr, cur_tset, pending_prod, complete, log_dir))
             pending_prod = False
         rows = None
 
@@ -184,17 +216,37 @@ def assess(prod, equil):
     meanP, semP, tau, n_eff = mean_sem(P)
     stdP = float(P.std())
 
-    slope = float(np.polyfit(prod.t_ns, P, 1)[0])          # kbar/ns
-    drift = slope * (prod.t_ns[-1] - prod.t_ns[0])         # total kbar
+    slope = float(np.polyfit(prod.t_ns, P, 1)[0])          # GPa/ns
+    drift = slope * (prod.t_ns[-1] - prod.t_ns[0])         # total GPa
     drift_frac = abs(drift) / stdP if stdP > 0 else 0.0
 
     half = P.size // 2
     half_frac = (abs(P[:half].mean() - P[half:].mean()) / stdP
                  if stdP > 0 else 0.0)
 
+    # equil -> prod continuity. A clean test ONLY if equilibration settled AT
+    # the setpoint. Our equilibration ramps T (PREV -> tset), so its 2nd half is
+    # still hot and -- where dP/dT is steep (high T) -- gives a large spurious
+    # jump. Compare production to the equil samples that actually reached tset;
+    # if equilibration was a pure ramp (no settled tail), cont is informational
+    # only (drift/half/Neff govern equilibration within production).
+    cont_informational = False
     if equil is not None and equil.press.size >= 2 and stdP > 0:
-        eh = equil.press.size // 2
-        cont_frac = abs(float(equil.press[eh:].mean()) - meanP) / stdP
+        tol = max(0.02 * prod.tset, 25.0)            # within 2% (or 25 K) of tset
+        settled = np.abs(equil.temp - prod.tset) <= tol
+        nset = int(settled.sum())
+        # A clean HARD test only if equilibration genuinely HELD at the setpoint
+        # (a sustained settled period). A pure ramp merely grazes tset at its
+        # tail; that tail mean is ramp-biased (steep dP/dT at high T/density), so
+        # cont is informational there -- drift/half/Neff govern equilibration.
+        held = nset >= 10 and nset >= 0.25 * settled.size
+        if nset >= 10:
+            ref = float(equil.press[settled].mean())
+        else:
+            tail = max(equil.press.size // 10, 1)    # last 10%, nearest setpoint
+            ref = float(equil.press[-tail:].mean())
+        cont_frac = abs(ref - meanP) / stdP
+        cont_informational = not held
     else:
         cont_frac = float("nan")
 
@@ -224,7 +276,8 @@ def assess(prod, equil):
             fails.append("drift")
         if half_frac >= EQ_SHIFT_FRAC_MAX:
             fails.append("half")
-        if not np.isnan(cont_frac) and cont_frac >= EQ_SHIFT_FRAC_MAX:
+        if (not np.isnan(cont_frac) and not cont_informational
+                and cont_frac >= EQ_SHIFT_FRAC_MAX):
             fails.append("cont")
         if n_eff < EQ_MIN_NEFF:
             fails.append("Neff")
@@ -262,7 +315,7 @@ def assess(prod, equil):
 # --------------------------------------------------------------------------- #
 # Output                                                                       #
 # --------------------------------------------------------------------------- #
-_HDR = (f"{'T(K)':>6} {'<P>kbar':>9} {'+-SEM':>7} {'drift/s':>8} "
+_HDR = (f"{'T(K)':>6} {'<P>GPa':>9} {'+-SEM':>7} {'drift/s':>8} "
         f"{'half/s':>7} {'cont/s':>7} {'N_eff':>7} {'dCN':>8} "
         f"{'MSDend':>8} {'ns':>5}  verdict")
 
@@ -272,11 +325,19 @@ def fmt_row(r):
         return f"{'  n/a':>{w}}" if (isinstance(x, float) and np.isnan(x)) \
             else f"{x:>{w}.{p.split('.')[1][0]}f}"
     note = ("  [" + ",".join(r["fails"]) + "]") if r["fails"] else ""
-    return (f"{r['T']:>6.0f} {r['meanP']:>9.2f} {r['semP']:>7.3f} "
+    return (f"{r['T']:>6.0f} {r['meanP']:>9.3f} {r['semP']:>7.4f} "
             f"{r['drift_frac']:>8.2f} {r['half_frac']:>7.2f} "
             f"{g(r['cont_frac'],7)} {r['N_eff']:>7.0f} "
             f"{g(r['dcn'],8,'8.4f')} {r['msd_end']:>8.0f} "
             f"{r['len_ns']:>5.1f}  {r['verdict']}{note}")
+
+
+def running_average(x, window=9):
+    x = np.asarray(x, dtype=float)
+    if x.size < 2:
+        return x
+    window = max(1, min(window, x.size))
+    return uniform_filter1d(x, size=window, mode="nearest")
 
 
 def make_plots(results, blocks, out_dir):
@@ -289,27 +350,39 @@ def make_plots(results, blocks, out_dir):
     for prod, r in zip(prods, results):
         fig, ax = plt.subplots(2, 2, figsize=(9, 6))
         fig.suptitle(f"T = {r['T']:.0f} K   verdict: {r['verdict']}")
-        ax[0, 0].plot(prod.t_ns, prod.press); ax[0, 0].set_ylabel("P (kbar)")
+        ax[0, 0].plot(prod.t_ns, prod.press)
+        ax[0, 0].plot(prod.t_ns, running_average(prod.press), lw=2.5,
+                      ls="-", color="C1", alpha=1.0)
+        ax[0, 0].set_ylabel("P (GPa)")
         ax[0, 0].axhline(r["meanP"], color="r", lw=0.8, ls="--")
-        ax[0, 1].plot(prod.t_ns, prod.pe); ax[0, 1].set_ylabel("PE (eV)")
+        ax[0, 1].plot(prod.t_ns, prod.pe)
+        ax[0, 1].plot(prod.t_ns, running_average(prod.pe), lw=2.5,
+                      ls="-", color="C1", alpha=1.0)
+        ax[0, 1].set_ylabel("PE (eV)")
         if prod.cn is not None:
             ax[1, 0].plot(prod.t_ns, prod.cn)
+            ax[1, 0].plot(prod.t_ns, running_average(prod.cn), lw=2.5,
+                          ls="-", color="C1", alpha=1.0)
         ax[1, 0].set_ylabel("CN Si-O"); ax[1, 0].set_xlabel("t (ns)")
-        if prod.msd is not None:
-            # MSD log-log vs time in ps (smallest unit) to resolve the regimes:
-            #   ballistic  MSD ~ t^2   (short time, free flight)
-            #   caging     MSD ~ flat  (transitional plateau, low T)
-            #   diffusive  MSD ~ t^1   (long time)
-            tps = prod.t_ns * 1000.0
-            m = (tps > 0) & (prod.msd > 0)
-            tp, mp = tps[m], prod.msd[m]
+        # RAW per-step MSD (from msd_<T>K.dat) if available, else thermo-grid.
+        if prod.msd_raw is not None:
+            mt_ps, mv = prod.msd_raw_t * 1000.0, prod.msd_raw
+        elif prod.msd is not None:
+            mt_ps, mv = prod.t_ns * 1000.0, prod.msd
+        else:
+            mt_ps = mv = None
+        if mt_ps is not None:
+            # log-log vs time (ps) resolves the regimes: ballistic ~t^2,
+            # caging plateau, diffusive ~t^1.
+            m = (mt_ps > 0) & (mv > 0)
+            tp, mp = mt_ps[m], mv[m]
             ax[1, 1].loglog(tp, mp, lw=1.0)
-            # slope guides: t^2 anchored at the start, t^1 anchored at the end
-            ax[1, 1].loglog(tp, mp[0] * (tp / tp[0]) ** 2, "k--", lw=0.7,
-                            label=r"$t^2$ ballistic")
-            ax[1, 1].loglog(tp, mp[-1] * (tp / tp[-1]), "r--", lw=0.7,
-                            label=r"$t^1$ diffusive")
-            ax[1, 1].legend(fontsize=7, loc="upper left")
+            if tp.size > 2:
+                ax[1, 1].loglog(tp, mp[0] * (tp / tp[0]) ** 2, "k--", lw=0.7,
+                                label=r"$t^2$ ballistic")
+                ax[1, 1].loglog(tp, mp[-1] * (tp / tp[-1]), "r--", lw=0.7,
+                                label=r"$t^1$ diffusive")
+                ax[1, 1].legend(fontsize=7, loc="upper left")
         ax[1, 1].set_ylabel("Si MSD (A^2)"); ax[1, 1].set_xlabel("t (ps)")
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"eq_{r['T']:.0f}K.png"), dpi=110)
@@ -332,14 +405,19 @@ def write_csv(results, path):
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
-def resolve_log(path):
+def resolve_logs(path):
+    """Return the log file(s) to parse: log.lammps if present, else the chained
+    per-segment logs log.seg*.lammps (in order), else the file itself."""
     if os.path.isdir(path):
         cand = os.path.join(path, "log.lammps")
         if os.path.isfile(cand):
-            return cand
-        raise SystemExit(f"No log.lammps in directory {path}")
+            return [cand]
+        segs = sorted(glob.glob(os.path.join(path, "log.seg*.lammps")))
+        if segs:
+            return segs
+        raise SystemExit(f"No log.lammps / log.seg*.lammps in {path}")
     if os.path.isfile(path):
-        return path
+        return [path]
     raise SystemExit(f"Not found: {path}")
 
 
@@ -356,8 +434,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     DT_PS = args.dt
 
-    log_file = resolve_log(args.path)
-    blocks = parse_log(log_file)
+    log_files = resolve_logs(args.path)
+    blocks = parse_log(log_files)
     prods = list(pair_production(blocks))
     if not prods:
         raise SystemExit(
@@ -366,9 +444,11 @@ def main(argv=None):
 
     results = [assess(prod, eq) for prod, eq in prods]
 
-    label = os.path.basename(os.path.dirname(os.path.abspath(log_file))) \
-        or os.path.basename(os.path.abspath(log_file))
-    print(f"# Equilibration check: {label}  ({log_file})")
+    src = log_files[0] if len(log_files) == 1 else \
+        f"{os.path.dirname(log_files[0])}/log.seg*.lammps"
+    label = os.path.basename(os.path.dirname(os.path.abspath(log_files[0]))) \
+        or os.path.basename(os.path.abspath(log_files[0]))
+    print(f"# Equilibration check: {label}  ({src})")
     print(f"# slow variable = pressure; *_/s = fraction of std(P)={'':s}"
           f" thresholds drift<{EQ_DRIFT_FRAC_MAX} half/cont<{EQ_SHIFT_FRAC_MAX}"
           f" N_eff>{EQ_MIN_NEFF:.0f} |dCN|<{CRYSTAL_DCN}")
@@ -386,7 +466,7 @@ def main(argv=None):
         write_csv(results, args.csv)
         print(f"# wrote {args.csv}")
     if args.plot:
-        out = os.path.join(os.path.dirname(os.path.abspath(log_file)), "eq_plots")
+        out = os.path.join(os.path.dirname(os.path.abspath(log_files[0])), "eq_plots")
         make_plots(results, blocks, out)
         print(f"# wrote plots -> {out}")
 

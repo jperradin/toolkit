@@ -168,6 +168,7 @@ def plot_overlay(curves, out_dir):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(6.5, 5))
+    ax.set_prop_cycle(color=plt.cm.viridis(np.linspace(0, 1, len(curves))))
     for T, (t, msd) in sorted(curves.items()):
         ax.loglog(t, msd, lw=1.1, label=f"{T} K")
     ax.set_xlabel("t (ps)")
