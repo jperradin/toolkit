@@ -1,62 +1,126 @@
-# This script convert the lammps .data files to .xyz files
-# with Lattice information in the comment line
+#!/usr/bin/env python3
+"""Convert a LAMMPS xyz dump of an NPT run to extended-XYZ with per-frame box.
 
-import numpy as np
-from natsort import natsorted
-import sys
+Each frame of the dump carries its timestep in the comment line
+("Atoms. Timestep: N"). The cubic box edge at that step is read from the run's
+log (thermo Lx column), so no separate boxes file is needed. Output frames get
+a proper extended-XYZ header:
+
+    Lattice="L 0 0 0 L 0 0 0 L" Properties=species:S:1:pos:R:3
+
+Types are mapped 1->O, 2->Si, 3->Na.
+
+usage: ./toolkit/convert_to_xyz-npt.py pos_2000K.data [pos_...data ...]
+           [--log log.lammps] [--out out.xyz]
+       (default log: log.lammps next to each pos file; default out: <pos>.xyz)
+"""
+import argparse
 import os
+import sys
 
-rootdir = os.getcwd()
-n_atoms = np.int32(sys.argv[1])
-boxes_path = sys.argv[2]
+TYPEMAP = {"1": "O", "2": "Si", "3": "Na"}
 
 
-counter_file = 0
-for subdir, dirs, files in os.walk(rootdir):
-    dirs.sort()
-    files = natsorted(files)
-    for file in files:
-        if file == "convert_to_xyz-npt.py":
+def lx_by_step(log_file):
+    """{step: Lx} from every thermo table of a LAMMPS log."""
+    out = {}
+    cols = None
+    ilx = istep = None
+    with open(log_file) as fh:
+        for line in fh:
+            p = line.split()
+            if p and p[0] == "Step":
+                cols = p
+                istep, ilx = p.index("Step"), p.index("Lx")
+                continue
+            if cols is None or len(p) != len(cols):
+                continue
+            try:
+                out[int(float(p[istep]))] = float(p[ilx])
+            except ValueError:
+                continue
+    if not out:
+        raise SystemExit(f"no thermo table with Lx in {log_file}")
+    return out
+
+
+def find_heads(data):
+    """[(natoms, step, count_line_start, atoms_start)] per frame header.
+
+    Headers are located by searching the raw bytes for the literal
+    "Atoms. Timestep:" -- far cheaper than a line-anchored regex over
+    millions of atom lines.
+    """
+    heads = []
+    j = 0
+    while True:
+        c = data.find(b"Atoms. Timestep:", j)
+        if c == -1:
+            return heads
+        line_start = data.rfind(b"\n", 0, c) + 1
+        count_start = data.rfind(b"\n", 0, max(line_start - 1, 0)) + 1
+        eol = data.find(b"\n", c)
+        heads.append((int(data[count_start:line_start]),
+                      int(data[c + 16:eol]), count_start, eol + 1))
+        j = eol
+
+
+def map_types(data):
+    """Map type digits to species at atom-line starts, whole buffer at once.
+
+    Safe because only atom lines start with '<digit> ': count lines have no
+    trailing token and comment lines start with ' Atoms.'.
+    """
+    for t, sym in TYPEMAP.items():
+        data = data.replace(b"\n%s " % t.encode(), b"\n%s " % sym.encode())
+    return data
+
+
+def convert(pos_file, log_file, out_file):
+    lx = lx_by_step(log_file)
+    with open(pos_file, "rb") as f:
+        data = f.read()
+    if data and not data.endswith(b"\n"):
+        data += b"\n"
+    data = map_types(data)
+    heads = find_heads(data)
+    parts = []
+    nframes = nskip = 0
+    for i, (n, step, _, astart) in enumerate(heads):
+        end = heads[i + 1][2] if i + 1 < len(heads) else len(data)
+        L = lx.get(step)
+        if L is None:
+            nskip += 1
             continue
-        boxes = []
-        boxes_file = os.path.join(
-            boxes_path, file.replace("pos", "boxes").replace(".data", "")
-        )
-        with open(boxes_file, "r") as inp:
-            lines = inp.readlines()
-            for line in lines:
-                boxes.append(float(line.strip()))
-        boxes = np.array(boxes)
+        parts.append(f'{n}\nLattice="{L} 0.0 0.0 0.0 {L} 0.0 0.0 0.0 {L}" '
+                     f'Properties=species:S:1:pos:R:3 Timestep={step}\n'
+                     .encode())
+        parts.append(data[astart:end])
+        nframes += 1
+    with open(out_file, "wb") as out:
+        out.write(b"".join(parts))
+    skip = f", {nskip} frame(s) skipped (step not in log)" if nskip else ""
+    print(f"{pos_file}: {nframes} frame(s) -> {out_file}{skip}")
 
-        expected_files = len(boxes)
-        if file.split(".")[1] == "data":
-            with open(file, "r") as inp:
-                with open(file.split(".")[0] + ".xyz", "w") as out:
-                    print(f"converting {file}")
-                    counter_line = 0
-                    lines = inp.readlines()
-                    for line in lines:
-                        try:
-                            if (
-                                line.split(".")[0] == " Atoms"
-                                or line.split(".")[0] == "Atoms"
-                            ):
-                                out.write(
-                                    f'Lattice="{boxes[counter_line]} 0.0 0.0 0.0 {boxes[counter_line]} 0.0 0.0 0.0 {boxes[counter_line]}"\n'
-                                )
-                                counter_line += 1
-                            elif line.split()[0] == f"{n_atoms}":
-                                out.write(line)
-                            elif line.split()[0] == "1":
-                                parts = line.split()
-                                out.write(f"O {parts[1]} {parts[2]} {parts[3]}\n")
-                            elif line.split()[0] == "2":
-                                parts = line.split()
-                                out.write(f"Si {parts[1]} {parts[2]} {parts[3]}\n")
-                            elif line.split()[0] == "3":
-                                parts = line.split()
-                                out.write(f"Na {parts[1]} {parts[2]} {parts[3]}\n")
-                        except:
-                            pass
 
-            counter_file += 1
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("pos", nargs="+", help="xyz dump file(s) (pos_*.data)")
+    p.add_argument("--log", help="log file with thermo Lx "
+                                 "(default: log.lammps next to each pos file)")
+    p.add_argument("--out", help="output xyz (single pos file only; "
+                                 "default: <pos>.xyz)")
+    args = p.parse_args(argv)
+    if args.out and len(args.pos) > 1:
+        p.error("--out only valid with a single pos file")
+    for pos in args.pos:
+        log = args.log or os.path.join(os.path.dirname(os.path.abspath(pos)),
+                                       "log.lammps")
+        out = args.out or os.path.splitext(pos)[0] + ".xyz"
+        convert(pos, log, out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

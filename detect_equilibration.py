@@ -53,8 +53,8 @@ _C_STEP = "Step"
 _C_TEMP = "Temp"
 _C_PE = "PotEng"
 _C_PRESS = "Press"
-_C_MSD = "c_msd1[4]"
-_C_CN = "c_cnSiO"
+_C_MSD = ""
+_C_CN = ""
 
 _NVT_RE = re.compile(r"\bnvt\s+temp\s+(\S+)\s+(\S+)")
 _AVG_RE = re.compile(r"\bave/time\b")
